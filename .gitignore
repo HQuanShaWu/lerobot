@@ -177,3 +177,8 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# checkpoint
+diffusionpolicy/train/
+efficientvla/train/
+Rheovla/output/
