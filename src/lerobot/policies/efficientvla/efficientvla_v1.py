@@ -51,11 +51,11 @@ class RoboBrainBackbone(nn.Module):
         tune_visual: bool = False,
         use_flash_attention: bool = False,
         load_bf16: bool = False,
-        project_to_dim: int = 384,
+        project_to_dim: int = 768,
     ):
         """
         Lightweight wrapper around RoboBrain base model to emit backbone_features/attention_mask.
-        We keep a projection to 384 (1/4 of the original 1536) so the action head dimensions remain unchanged.
+        We keep a projection to 768 (1/2 of the original 1536) so the action head dimensions remain unchanged.
         """
         super().__init__()
         if AutoConfig is None or Qwen2_5_VLForConditionalGeneration is None:
@@ -78,8 +78,8 @@ class RoboBrainBackbone(nn.Module):
         self.tune_visual = tune_visual
         self.set_trainable_parameters()
 
-    def set_trainable_parameters(self, tune_visual=False, tune_llm=False):
-        self.tune_visual, self.tune_llm = tune_visual, tune_llm
+    def set_trainable_parameters(self, tune_llm=False, tune_visual=False):
+        self.tune_llm, tune_visual = tune_llm, tune_visual
         assert self.tune_llm == self.tune_visual, \
             "Currently, it does not support fine-tuning only one of LLM and Visual Tower."
         
@@ -178,7 +178,7 @@ class EfficientVLAV1(PreTrainedModel):
                 "tokenizer_assets_repo": DEFAULT_TOKENIZER_ASSETS_REPO,
                 "tune_llm": False,
                 "tune_visual": False,
-                "project_to_dim": 384,
+                "project_to_dim": 768,
             }
         if not isinstance(config.action_head_cfg, dict) or not config.action_head_cfg:
             # Minimal defaults; adjust if your action space differs
@@ -188,19 +188,19 @@ class EfficientVLAV1(PreTrainedModel):
                 "max_state_dim": getattr(config, "max_state_dim", 64),
                 "max_action_dim": getattr(config, "action_dim", 32),
                 "max_num_embodiments": 32,
-                "input_embedding_dim": 384,
-                "backbone_embedding_dim": 384,
-                "vl_projection_hidden_dim": 256,
+                "input_embedding_dim": 768,
+                "backbone_embedding_dim": 768,
+                "vl_projection_hidden_dim": 512,
                 "vl_self_attention_cfg": {
-                    "num_attention_heads": 4,
-                    "attention_head_dim": 32,  # 4*32=128 target dim
+                    "num_attention_heads": 8,
+                    "attention_head_dim": 32,  # 8*32=256 target dim
                     "num_layers": 2,
                     "dropout": 0.0,
                     "max_num_positional_embeddings": 1024,
                     "interleave_self_attention": False,
                 },
                 "diffusion_model_cfg": {
-                    "num_attention_heads": 4,
+                    "num_attention_heads": 8,
                     "attention_head_dim": 32,
                 },
             }
@@ -359,7 +359,7 @@ class EfficientVLAV1(PreTrainedModel):
             "tokenizer_assets_repo": DEFAULT_TOKENIZER_ASSETS_REPO,
             "tune_llm": tune_llm,
             "tune_visual": tune_visual,
-            "project_to_dim": 384,
+            "project_to_dim": 768,
             "load_bf16": use_bf16  # 把 bf16 传进去
         }
 
@@ -369,8 +369,7 @@ class EfficientVLAV1(PreTrainedModel):
         model = cls(config, local_model_path=local_model_path)
 
         # 5. 设置可训练参数
-
-        model.backbone.set_trainable_parameters()
+        model.backbone.set_trainable_parameters(tune_visual=tune_visual, tune_llm=tune_llm)
         model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )

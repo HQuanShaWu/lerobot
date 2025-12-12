@@ -181,4 +181,5 @@ outputs/
 # checkpoint
 diffusionpolicy/train/
 efficientvla/train/
+efficientvla/efficientvla/
 Rheovla/output/

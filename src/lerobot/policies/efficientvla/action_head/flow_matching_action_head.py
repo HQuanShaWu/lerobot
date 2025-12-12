@@ -118,15 +118,15 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     model_dtype: str = field(default="float32", metadata={"help": "Model data type."})
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {
-            "num_attention_heads": 4,
-            "attention_head_dim": 32,  # 4 * 32 = 128 inner dim (1/4 of previous 512)
+            "num_attention_heads": 8,
+            "attention_head_dim": 32,  # 8 * 32 = 256 inner dim (1/2 of previous 512)
         },
         metadata={"help": "Diffusion model configuration."},
     )
-    input_embedding_dim: int = field(default=384, metadata={"help": "Input embedding channel dimension."})
-    backbone_embedding_dim: int = field(default=384, metadata={"help": "Backbone embedding channel dimension."})
+    input_embedding_dim: int = field(default=768, metadata={"help": "Input embedding channel dimension."})
+    backbone_embedding_dim: int = field(default=768, metadata={"help": "Backbone embedding channel dimension."})
 
-    hidden_size: int = field(default=256, metadata={"help": "Input embedding dimension."})
+    hidden_size: int = field(default=512, metadata={"help": "Input embedding dimension."})
     max_seq_len: int = field(default=1024, metadata={"help": "Maximum Sequence Length"})
     action_dim: int = field(default=None, metadata={"help": "Action dimension."})
     action_horizon: int = field(default=None, metadata={"help": "Action horizon."})
@@ -148,7 +148,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=True, metadata={"help": "Whether to tune the diffusion model."}
     )
     vl_projection_hidden_dim: int = field(
-        default=256, metadata={"help": "Hidden dim for VL projector (backbone -> attn dim)."}
+        default=512, metadata={"help": "Hidden dim for VL projector (backbone -> attn dim)."}
     )
     load_pretrained_det_decode_layer_path: str = field(
         default=None, metadata={"help": "Path to pretrained detection model."}
@@ -161,8 +161,8 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
     vl_self_attention_cfg: dict = field(
         default_factory=lambda: {
-            "num_attention_heads": 4,
-            "attention_head_dim": 32,  # 4 * 32 = 128 target dim for projector
+            "num_attention_heads": 8,
+            "attention_head_dim": 32,  # 8 * 32 = 256 target dim for projector
             "num_layers": 2,
             "dropout": 0.0,
             "max_num_positional_embeddings": 1024,
@@ -221,7 +221,7 @@ class FlowmatchingActionHead(nn.Module):
         self.vl_self_attention = (
             SelfAttentionTransformer(**config.vl_self_attention_cfg) if config.use_vlln else nn.Identity()
         )
-        # Project backbone embeddings (384) into the self-attention inner dim (e.g., 128) with LN
+        # Project backbone embeddings (768) into the self-attention inner dim (e.g., 256) with LN
         if config.use_vlln:
             self.vl_target_dim = self.vl_self_attention.inner_dim
             self.vl_projector = nn.Sequential(
