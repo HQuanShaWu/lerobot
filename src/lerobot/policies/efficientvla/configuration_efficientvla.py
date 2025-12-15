@@ -39,6 +39,9 @@ class EfficientVLAConfig(PreTrainedConfig):
     # Maximum action dimension. Shorter actions will be zero-padded.
     max_action_dim: int = 32
 
+    # Scale preset for model dimensions(without backbone): large=origin, medium=1/2, tiny=1/4
+    scale: str = "medium"
+
     # Training-steps used.
     training_steps: int = 10000
 

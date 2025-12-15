@@ -44,6 +44,66 @@ from lerobot.policies.efficientvla.action_head.flow_matching_action_head import 
 DEFAULT_ROBOBRAIN_MODEL = "BAAI/RoboBrain2.0-3B"
 DEFAULT_TOKENIZER_ASSETS_REPO = "BAAI/RoboBrain2.0-3B"
 
+SCALE_PRESETS = {
+    "large": {
+        "project_to_dim": 1536,
+        "input_embedding_dim": 1536,
+        "backbone_embedding_dim": 1536,
+        "vl_projection_hidden_dim": 1024,
+        "hidden_size": 1024,
+        "vl_self_attention_cfg": {
+            "num_attention_heads": 8,
+            "attention_head_dim": 64,
+            "num_layers": 2,
+            "dropout": 0.0,
+            "max_num_positional_embeddings": 1024,
+            "interleave_self_attention": False,
+        },
+        "diffusion_model_cfg": {
+            "num_attention_heads": 8,
+            "attention_head_dim": 64,
+        },
+    },
+    "medium": {
+        "project_to_dim": 768,
+        "input_embedding_dim": 768,
+        "backbone_embedding_dim": 768,
+        "vl_projection_hidden_dim": 512,
+        "hidden_size": 512,
+        "vl_self_attention_cfg": {
+            "num_attention_heads": 8,
+            "attention_head_dim": 32,
+            "num_layers": 2,
+            "dropout": 0.0,
+            "max_num_positional_embeddings": 1024,
+            "interleave_self_attention": False,
+        },
+        "diffusion_model_cfg": {
+            "num_attention_heads": 8,
+            "attention_head_dim": 32,
+        },
+    },
+    "tiny": {
+        "project_to_dim": 384,
+        "input_embedding_dim": 384,
+        "backbone_embedding_dim": 384,
+        "vl_projection_hidden_dim": 256,
+        "hidden_size": 256,
+        "vl_self_attention_cfg": {
+            "num_attention_heads": 4,
+            "attention_head_dim": 32,
+            "num_layers": 2,
+            "dropout": 0.0,
+            "max_num_positional_embeddings": 1024,
+            "interleave_self_attention": False,
+        },
+        "diffusion_model_cfg": {
+            "num_attention_heads": 4,
+            "attention_head_dim": 32,
+        },
+    },
+}
+
 
 class RoboBrainBackbone(nn.Module):
     def __init__(
@@ -103,7 +163,6 @@ class RoboBrainBackbone(nn.Module):
 
         self.set_trainable_parameters()
 
-
     def set_trainable_parameters(self, tune_visual=False, tune_llm=False):
         self.tune_visual, self.tune_llm = tune_visual, tune_llm
         assert self.tune_llm == self.tune_visual, \
@@ -121,7 +180,6 @@ class RoboBrainBackbone(nn.Module):
                 print(f"Tune backbone llm/visual: LoRA")
             else:
                 print(f"Tune backbone llm/visual: {self.tune_llm}/{self.tune_visual}")
-
 
     def set_frozen_modules_to_eval_mode(self):
         if self.training and not (self.tune_llm or self.tune_visual):
@@ -205,13 +263,16 @@ class EfficientVLAV1(PreTrainedModel):
         self.local_model_path = local_model_path
 
         # Guard against missing cfg blocks when loading a freshly converted checkpoint
+        preset_scale = getattr(config, "scale", "medium")
+        preset = SCALE_PRESETS.get(preset_scale, SCALE_PRESETS["medium"])
+
         if not isinstance(config.backbone_cfg, dict) or not config.backbone_cfg:
             config.backbone_cfg = {
                 "model_path": local_model_path,
                 "tokenizer_assets_repo": DEFAULT_TOKENIZER_ASSETS_REPO,
                 "tune_llm": False,
                 "tune_visual": False,
-                "project_to_dim": 768,
+                "project_to_dim": preset["project_to_dim"],
                 "lora_rank": 0,
                 "lora_alpha": 16,
                 "lora_dropout": 0.1,
@@ -225,21 +286,12 @@ class EfficientVLAV1(PreTrainedModel):
                 "max_state_dim": getattr(config, "max_state_dim", 64),
                 "max_action_dim": getattr(config, "action_dim", 32),
                 "max_num_embodiments": 32,
-                "input_embedding_dim": 768,
-                "backbone_embedding_dim": 768,
-                "vl_projection_hidden_dim": 512,
-                "vl_self_attention_cfg": {
-                    "num_attention_heads": 8,
-                    "attention_head_dim": 32,  # 8*32=256 target dim
-                    "num_layers": 2,
-                    "dropout": 0.0,
-                    "max_num_positional_embeddings": 1024,
-                    "interleave_self_attention": False,
-                },
-                "diffusion_model_cfg": {
-                    "num_attention_heads": 8,
-                    "attention_head_dim": 32,
-                },
+                "input_embedding_dim": preset["input_embedding_dim"],
+                "backbone_embedding_dim": preset["backbone_embedding_dim"],
+                "vl_projection_hidden_dim": preset["vl_projection_hidden_dim"],
+                "hidden_size": preset["hidden_size"],
+                "vl_self_attention_cfg": preset["vl_self_attention_cfg"],
+                "diffusion_model_cfg": preset["diffusion_model_cfg"],
             }
 
         self.backbone = RoboBrainBackbone(**config.backbone_cfg)
@@ -371,53 +423,63 @@ class EfficientVLAV1(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        # 1. 提取参数
         tune_visual = kwargs.pop("tune_visual", False)
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
-        use_bf16 = kwargs.get("use_bf16", True) # 默认开启 bf16
+        use_bf16 = kwargs.get("use_bf16", True)  # 默认开启 bf16
         lora_rank = kwargs.pop("lora_rank", 0)
         lora_alpha = kwargs.pop("lora_alpha", 16)
         lora_dropout = kwargs.pop("lora_dropout", 0.1)
         lora_full_model = kwargs.pop("lora_full_model", False)
+        scale = kwargs.pop("scale", "medium").lower()
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path} (Manual Mode)")
 
-        # 2. 获取本地路径 (不加载权重，只拿路径)
         try:
             local_model_path = snapshot_download(pretrained_model_name_or_path, repo_type="model")
         except (HFValidationError, RepositoryNotFoundError):
             local_model_path = pretrained_model_name_or_path
 
-        # 3. 手动构建 Config
-        # 我们不再依赖 HF 的自动 Config 加载，而是手动创建一个干净的 Config
+        preset = SCALE_PRESETS.get(scale)
+        if preset is None:
+            raise ValueError(f"Unknown scale '{scale}'. Expected one of {list(SCALE_PRESETS)}")
+
         config = cls.config_class()
-        
-        # 填充 Backbone 配置
+        config.scale = scale
         config.backbone_cfg = {
             "model_path": local_model_path,
             "tokenizer_assets_repo": DEFAULT_TOKENIZER_ASSETS_REPO,
             "tune_llm": tune_llm,
             "tune_visual": tune_visual,
-            "project_to_dim": 768,
-            "load_bf16": use_bf16,  # 把 bf16 传进去
+            "project_to_dim": preset["project_to_dim"],
+            "load_bf16": use_bf16,
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
             "lora_full_model": lora_full_model,
         }
 
-        # 4. 实例化模型 (这会触发 Backbone 内部的 from_pretrained)
-        # 因为绕过了 super().from_pretrained，外层 wrapper 不会尝试读取权重文件
-        # 这避免了 "权重不匹配" 的警告，也避免了 "全0权重" 的 bug
+        if not config.action_head_cfg:
+            config.action_head_cfg = {
+                "action_dim": getattr(config, "action_dim", 32),
+                "action_horizon": getattr(config, "action_horizon", 16),
+                "max_state_dim": getattr(config, "max_state_dim", 64),
+                "max_action_dim": getattr(config, "action_dim", 32),
+                "max_num_embodiments": 32,
+                "input_embedding_dim": preset["input_embedding_dim"],
+                "backbone_embedding_dim": preset["backbone_embedding_dim"],
+                "vl_projection_hidden_dim": preset["vl_projection_hidden_dim"],
+                "hidden_size": preset["hidden_size"],
+                "vl_self_attention_cfg": preset["vl_self_attention_cfg"],
+                "diffusion_model_cfg": preset["diffusion_model_cfg"],
+            }
+
         model = cls(config, local_model_path=local_model_path)
 
-        # 5. 设置可训练参数
         model.backbone.set_trainable_parameters(tune_visual=tune_visual, tune_llm=tune_llm)
         model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )
-
 
         return model

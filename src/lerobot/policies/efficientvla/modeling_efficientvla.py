@@ -76,6 +76,7 @@ class EfficientVLAPolicy(PreTrainedPolicy):
             lora_alpha=self.config.lora_alpha,
             lora_dropout=self.config.lora_dropout,
             lora_full_model=self.config.lora_full_model,
+            scale=getattr(self.config, "scale", "medium"),
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
