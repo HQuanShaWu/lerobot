@@ -23,6 +23,9 @@ import torch.nn as nn
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 
+from peft import LoraConfig, get_peft_model
+
+
 from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
@@ -52,6 +55,10 @@ class RoboBrainBackbone(nn.Module):
         use_flash_attention: bool = False,
         load_bf16: bool = False,
         project_to_dim: int = 768,
+        lora_rank: int = 0,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
+        lora_full_model: bool = False,
     ):
         """
         Lightweight wrapper around RoboBrain base model to emit backbone_features/attention_mask.
@@ -76,19 +83,45 @@ class RoboBrainBackbone(nn.Module):
 
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
+        self.use_lora = lora_rank is not None and lora_rank > 0
+
+        if self.use_lora:
+            if LoraConfig is None or get_peft_model is None:
+                raise ImportError("peft is required for LoRA fine-tuning but is not installed.")
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            if lora_full_model:
+                target_modules += ["up_proj", "gate_proj", "down_proj"]
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=target_modules,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.model = get_peft_model(self.model, lora_config)
+
         self.set_trainable_parameters()
 
-    def set_trainable_parameters(self, tune_llm=False, tune_visual=False):
-        self.tune_llm, tune_visual = tune_llm, tune_visual
+
+    def set_trainable_parameters(self, tune_visual=False, tune_llm=False):
+        self.tune_visual, self.tune_llm = tune_visual, tune_llm
         assert self.tune_llm == self.tune_visual, \
             "Currently, it does not support fine-tuning only one of LLM and Visual Tower."
         
         for p in self.parameters():
             p.requires_grad = True
         if not self.tune_llm and not self.tune_visual:
-            for p in self.model.parameters():
-                p.requires_grad = False
-        print(f"Tune backbone llm/visual: {self.tune_llm}/{self.tune_visual}")
+            for name, p in self.model.named_parameters():
+                if self.use_lora and "lora_" in name:
+                    p.requires_grad = True
+                else:
+                    p.requires_grad = False
+            if self.use_lora:
+                print(f"Tune backbone llm/visual: LoRA")
+            else:
+                print(f"Tune backbone llm/visual: {self.tune_llm}/{self.tune_visual}")
+
 
     def set_frozen_modules_to_eval_mode(self):
         if self.training and not (self.tune_llm or self.tune_visual):
@@ -179,6 +212,10 @@ class EfficientVLAV1(PreTrainedModel):
                 "tune_llm": False,
                 "tune_visual": False,
                 "project_to_dim": 768,
+                "lora_rank": 0,
+                "lora_alpha": 16,
+                "lora_dropout": 0.1,
+                "lora_full_model": False,
             }
         if not isinstance(config.action_head_cfg, dict) or not config.action_head_cfg:
             # Minimal defaults; adjust if your action space differs
@@ -340,6 +377,10 @@ class EfficientVLAV1(PreTrainedModel):
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         use_bf16 = kwargs.get("use_bf16", True) # 默认开启 bf16
+        lora_rank = kwargs.pop("lora_rank", 0)
+        lora_alpha = kwargs.pop("lora_alpha", 16)
+        lora_dropout = kwargs.pop("lora_dropout", 0.1)
+        lora_full_model = kwargs.pop("lora_full_model", False)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path} (Manual Mode)")
 
@@ -360,7 +401,11 @@ class EfficientVLAV1(PreTrainedModel):
             "tune_llm": tune_llm,
             "tune_visual": tune_visual,
             "project_to_dim": 768,
-            "load_bf16": use_bf16  # 把 bf16 传进去
+            "load_bf16": use_bf16,  # 把 bf16 传进去
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "lora_full_model": lora_full_model,
         }
 
         # 4. 实例化模型 (这会触发 Backbone 内部的 from_pretrained)
