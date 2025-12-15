@@ -7,12 +7,13 @@ lerobot-train \
   --policy.type=efficientvla \
   --policy.device=cuda \
   --policy.repo_id=lerobot/diffusion_pusht \
-  --policy.lora_rank=8 \
+  --policy.lora_rank=32 \
   --policy.scale="medium" \
   --output_dir=efficientvla/train/midscale_horizon16_20ksteps_lora_rank8_backbone \
   --job_name=train_efficientvla \
   --wandb.enable=false \
-  --batch_size=3 \
+  --batch_size=4 \
   --steps=${training_steps} \
   --policy.training_steps=${training_steps} \
+  --save_freq=60000 \
   # --use_policy_training_preset=false \
