@@ -192,21 +192,27 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
 
 def _build_robobrain_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
     """
-    Build RoboBrain processor; ensure assets are present locally.
+    Build RoboBrain processor; prefer a user-provided local path, otherwise fall back to cached HF repo.
 
-    Uses HF_LEROBOT_HOME as cache root; if the expected directory doesn't have processor_config.json,
-    it downloads the repo into that cache first.
+    Resolution order:
+    1) If `tokenizer_assets_repo` points to an existing path containing processor_config.json, use it.
+    2) Else, check HF_LEROBOT_HOME/<tokenizer_assets_repo> cache; if missing, download from Hub.
     """
-    cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
-    if not (cache_dir / "processor_config.json").exists():
-        cache_dir = Path(
-            snapshot_download(
-                tokenizer_assets_repo,
-                repo_type="model",
-                cache_dir=HF_LEROBOT_HOME,
-                local_dir=None,
+    local_dir = Path(tokenizer_assets_repo).expanduser()
+    if (local_dir / "processor_config.json").exists():
+        cache_dir = local_dir
+    else:
+        cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
+        if not (cache_dir / "processor_config.json").exists():
+            cache_dir = Path(
+                snapshot_download(
+                    tokenizer_assets_repo,
+                    repo_type="model",
+                    cache_dir=HF_LEROBOT_HOME,
+                    local_dir=None,
+                )
             )
-        )
+
     proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True)
     if hasattr(proc, "tokenizer"):
         proc.tokenizer.padding_side = "left"
