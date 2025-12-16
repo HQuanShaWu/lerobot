@@ -52,6 +52,76 @@ from lerobot.utils.utils import (
 )
 
 
+# def update_policy(
+#     train_metrics: MetricsTracker,
+#     policy: PreTrainedPolicy,
+#     batch: Any,
+#     optimizer: Optimizer,
+#     grad_clip_norm: float,
+#     accelerator: Accelerator,
+#     lr_scheduler=None,
+#     lock=None,
+# ) -> tuple[MetricsTracker, dict]:
+#     """
+#     Performs a single training step to update the policy's weights.
+
+#     This function executes the forward and backward passes, clips gradients, and steps the optimizer and
+#     learning rate scheduler. Accelerator handles mixed-precision training automatically.
+
+#     Args:
+#         train_metrics: A MetricsTracker instance to record training statistics.
+#         policy: The policy model to be trained.
+#         batch: A batch of training data.
+#         optimizer: The optimizer used to update the policy's parameters.
+#         grad_clip_norm: The maximum norm for gradient clipping.
+#         accelerator: The Accelerator instance for distributed training and mixed precision.
+#         lr_scheduler: An optional learning rate scheduler.
+#         lock: An optional lock for thread-safe optimizer updates.
+
+#     Returns:
+#         A tuple containing:
+#         - The updated MetricsTracker with new statistics for this step.
+#         - A dictionary of outputs from the policy's forward pass, for logging purposes.
+#     """
+#     start_time = time.perf_counter()
+#     policy.train()
+
+#     # Let accelerator handle mixed precision
+#     with accelerator.autocast():
+#         loss, output_dict = policy.forward(batch)
+#         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+
+#     # Use accelerator's backward method
+#     accelerator.backward(loss)
+
+#     # Clip gradients if specified
+#     if grad_clip_norm > 0:
+#         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+#     else:
+#         grad_norm = torch.nn.utils.clip_grad_norm_(
+#             policy.parameters(), float("inf"), error_if_nonfinite=False
+#         )
+
+#     # Optimizer step
+#     with lock if lock is not None else nullcontext():
+#         optimizer.step()
+
+#     optimizer.zero_grad()
+
+#     # Step through pytorch scheduler at every batch instead of epoch
+#     if lr_scheduler is not None:
+#         lr_scheduler.step()
+
+#     # Update internal buffers if policy has update method
+#     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+#         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+
+#     train_metrics.loss = loss.item()
+#     train_metrics.grad_norm = grad_norm.item()
+#     train_metrics.lr = optimizer.param_groups[0]["lr"]
+#     train_metrics.update_s = time.perf_counter() - start_time
+#     return train_metrics, output_dict
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -61,65 +131,59 @@ def update_policy(
     accelerator: Accelerator,
     lr_scheduler=None,
     lock=None,
+    # === [修改 1] 新增两个参数 ===
+    grad_accumulation_steps: int = 1,
+    step_idx: int = 0, 
+    # ===========================
 ) -> tuple[MetricsTracker, dict]:
-    """
-    Performs a single training step to update the policy's weights.
-
-    This function executes the forward and backward passes, clips gradients, and steps the optimizer and
-    learning rate scheduler. Accelerator handles mixed-precision training automatically.
-
-    Args:
-        train_metrics: A MetricsTracker instance to record training statistics.
-        policy: The policy model to be trained.
-        batch: A batch of training data.
-        optimizer: The optimizer used to update the policy's parameters.
-        grad_clip_norm: The maximum norm for gradient clipping.
-        accelerator: The Accelerator instance for distributed training and mixed precision.
-        lr_scheduler: An optional learning rate scheduler.
-        lock: An optional lock for thread-safe optimizer updates.
-
-    Returns:
-        A tuple containing:
-        - The updated MetricsTracker with new statistics for this step.
-        - A dictionary of outputs from the policy's forward pass, for logging purposes.
-    """
+    
     start_time = time.perf_counter()
     policy.train()
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
         loss, output_dict = policy.forward(batch)
-        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+        # === [修改 2] Loss 必须除以累积步数，因为梯度是累加的 ===
+        loss = loss / grad_accumulation_steps
 
     # Use accelerator's backward method
     accelerator.backward(loss)
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+    # === [修改 3] 只有当凑够了累积步数，或者是最后一步时，才进行参数更新 ===
+    should_update = (step_idx + 1) % grad_accumulation_steps == 0
+    
+    if should_update:
+        # Clip gradients if specified
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), float("inf"), error_if_nonfinite=False
+            )
 
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+        # Optimizer step
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
 
-    optimizer.zero_grad()
+        optimizer.zero_grad()
 
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+        # Step through pytorch scheduler at every batch instead of epoch
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
-    # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+        # Update internal buffers if policy has update method
+        if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+            accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.item()
-    train_metrics.lr = optimizer.param_groups[0]["lr"]
+        # 记录梯度范数和学习率 (仅在更新时记录)
+        train_metrics.grad_norm = grad_norm.item()
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
+
+    # === [修改 4] 还原 Loss 数值用于日志显示 (不然看着 Loss 很小) ===
+    # 注意：如果这步没更新参数，grad_norm 和 lr 保持上一次的值即可
+    train_metrics.loss = loss.item() * grad_accumulation_steps
     train_metrics.update_s = time.perf_counter() - start_time
+    
     return train_metrics, output_dict
 
 
@@ -323,8 +387,32 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         accelerator=accelerator,
     )
 
+    # if is_main_process:
+    #     logging.info("Start offline training on a fixed dataset")
+
+    # for _ in range(step, cfg.steps):
+    #     start_time = time.perf_counter()
+    #     batch = next(dl_iter)
+    #     batch = preprocessor(batch)
+    #     train_tracker.dataloading_s = time.perf_counter() - start_time
+
+    #     train_tracker, output_dict = update_policy(
+    #         train_tracker,
+    #         policy,
+    #         batch,
+    #         optimizer,
+    #         cfg.optimizer.grad_clip_norm,
+    #         accelerator=accelerator,
+    #         lr_scheduler=lr_scheduler,
+    #     )
+
     if is_main_process:
         logging.info("Start offline training on a fixed dataset")
+
+    grad_acc_steps = getattr(cfg, "gradient_accumulation_steps", 1)
+    
+    if is_main_process:
+        logging.info(f"Gradient Accumulation Steps: {grad_acc_steps}")
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
@@ -340,10 +428,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
+            grad_accumulation_steps=grad_acc_steps,
+            step_idx=step, 
         )
 
-        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
-        # increment `step` here.
         step += 1
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
