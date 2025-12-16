@@ -215,6 +215,27 @@ def make_pre_post_processors(
     """
     if pretrained_path:
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
+        if isinstance(policy_cfg, EfficientVLAConfig):
+            pre_overrides = {}
+            post_overrides = {}
+            pre_overrides["efficientvla_pack_inputs_v1"] = {
+                "stats": kwargs.get("dataset_stats"),
+                "normalize_min_max": True,
+            }
+            try:
+                env_action_dim = policy_cfg.output_features["action"].shape[0]
+            except Exception:
+                env_action_dim = 0
+            
+            post_overrides["efficientvla_action_unpack_unnormalize_v1"] = {
+                "stats": kwargs.get("dataset_stats"),
+                "normalize_min_max": True,
+                "env_action_dim": env_action_dim,
+            }
+
+            kwargs["preprocessor_overrides"] = pre_overrides
+            kwargs["postprocessor_overrides"] = post_overrides
+
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
             # Need to override both stats AND normalize_min_max since saved config might be empty

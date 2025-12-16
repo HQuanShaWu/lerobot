@@ -181,8 +181,6 @@ def make_efficientvla_pre_post_processors(
 
 
 # EfficientVLA specific processor steps
-
-
 def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     # img_t: (B, C, H, W) float in [0,1] or uint8
     if img_t.dtype.is_floating_point:
@@ -217,7 +215,6 @@ def _build_robobrain_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_AS
     if hasattr(proc, "tokenizer"):
         proc.tokenizer.padding_side = "left"
     return proc
-
 
 @dataclass
 @ProcessorStepRegistry.register(name="efficientvla_pack_inputs_v1")
