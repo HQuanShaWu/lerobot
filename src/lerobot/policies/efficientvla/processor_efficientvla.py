@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import cv2
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from PIL import Image
@@ -136,6 +137,7 @@ def make_efficientvla_pre_post_processors(
         AddBatchDimensionProcessorStep(),
         # 3. Pack video/state/action/language/embodiment; apply optional min-max normalization before padding
         EfficientVLAPackInputsStep(
+            image_size=config.image_size,
             state_horizon=state_horizon,
             action_horizon=action_horizon,
             max_state_dim=max_state_dim,
@@ -219,6 +221,7 @@ def _build_robobrain_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_AS
 @dataclass
 @ProcessorStepRegistry.register(name="efficientvla_pack_inputs_v1")
 class EfficientVLAPackInputsStep(ProcessorStep):
+    image_size: tuple[int, int] = (224, 224)
     state_horizon: int = 1
     action_horizon: int = 16
     max_state_dim: int = 64
@@ -252,6 +255,7 @@ class EfficientVLAPackInputsStep(ProcessorStep):
                     (v.device for v in obs.values() if isinstance(v, torch.Tensor)), torch.device("cpu")
                 ),
             )
+            
             d = int(t.shape[-1]) if t.numel() > 0 else 0
             if d == target_dim:
                 return t
@@ -279,8 +283,32 @@ class EfficientVLAPackInputsStep(ProcessorStep):
         img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
         if not img_keys and "observation.image" in obs:
             img_keys = ["observation.image"]
+
+
         if img_keys:
             cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
+
+            # 修改开始
+            target_h, target_w = self.image_size
+            resized_cams = []
+            for cam_batch in cams:
+                b, h, w, c = cam_batch.shape
+                
+                if h != target_h or w != target_w:
+                    new_batch = np.zeros((b, target_h, target_w, c), dtype=cam_batch.dtype)
+                    for i in range(b):
+                        new_batch[i] = cv2.resize(
+                            cam_batch[i], 
+                            (target_w, target_h), 
+                            interpolation=cv2.INTER_LINEAR
+                        )
+                    resized_cams.append(new_batch)
+                else:
+                    resized_cams.append(cam_batch)
+            
+            cams = resized_cams
+            # 修改结束
+
             video = np.stack(cams, axis=1)  # (B, V, H, W, C)
             video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
             # Model validates that video.shape[3] == 3 (channels), so reorder to (B, T, V, C, H, W)

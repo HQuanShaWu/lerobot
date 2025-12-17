@@ -173,8 +173,11 @@ class EfficientVLAPolicy(PreTrainedPolicy):
         """Select single action from action queue."""
         self.eval()
 
+        # execution_horizon = 8
+
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)
+            # actions = actions[:, :execution_horizon, :]
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 

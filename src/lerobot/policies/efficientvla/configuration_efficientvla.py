@@ -113,7 +113,6 @@ class EfficientVLAConfig(PreTrainedConfig):
     # Whether to sample trajectories weighted by their length
     balance_trajectory_weights: bool = True
 
-
     def __post_init__(self):
         super().__post_init__()
 
