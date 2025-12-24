@@ -45,6 +45,9 @@ class EfficientVLAConfig(PreTrainedConfig):
     # Training-steps used.
     training_steps: int = 10000
 
+    # Gradient accumulation steps.
+    gradient_accumulation_steps: int = 1
+
     # Normalization (start with identity, adjust as needed)
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -174,10 +177,10 @@ class EfficientVLAConfig(PreTrainedConfig):
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
         """Return scheduler configuration."""
         return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(self.training_steps * self.warmup_ratio),  # 5% warmup by default
-            num_decay_steps=self.training_steps,  # Adjust based on training steps
+            num_warmup_steps=int(self.training_steps * self.warmup_ratio / self.gradient_accumulation_steps),  # 5% warmup by default
+            num_decay_steps=self.training_steps / self.gradient_accumulation_steps,  # Adjust based on training steps
             peak_lr=self.optimizer_lr,
-            decay_lr=self.optimizer_lr * 0.1,
+            decay_lr=self.optimizer_lr * 0.05,
         )
 
     @property
