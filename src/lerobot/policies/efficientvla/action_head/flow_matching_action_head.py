@@ -137,7 +137,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
         default=1000, metadata={"help": "Number of timestep discretization buckets."}
     )
     num_inference_timesteps: int = field(
-        default=None,
+        default=10,
         metadata={"help": "Number of inference steps for noise diffusion."},
     )
     max_num_embodiments: int = field(default=32, metadata={"help": "Number of embodiments."})
