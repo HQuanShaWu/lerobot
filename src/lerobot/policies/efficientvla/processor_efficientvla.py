@@ -15,33 +15,16 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
 import cv2
 from einops import rearrange
-from huggingface_hub import snapshot_download
 from PIL import Image
-from pathlib import Path
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
 
-
-from qwen_vl_utils import process_vision_info
-
-
-from lerobot.utils.import_utils import _transformers_available
-
-if TYPE_CHECKING or _transformers_available:
-    from transformers import AutoProcessor, ProcessorMixin
-else:
-    AutoProcessor = None
-    ProcessorMixin = object
-
-from lerobot.configs.types import (
-    FeatureType,
-    NormalizationMode,
-    PolicyFeature,
-)
 from lerobot.policies.efficientvla.configuration_efficientvla import EfficientVLAConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -57,14 +40,10 @@ from lerobot.processor.converters import (
     transition_to_policy_action,
 )
 from lerobot.processor.core import EnvTransition, TransitionKey
-from lerobot.utils.constants import (
-    HF_LEROBOT_HOME,
-    POLICY_POSTPROCESSOR_DEFAULT_NAME,
-    POLICY_PREPROCESSOR_DEFAULT_NAME,
-)
+from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
-# Defaults for RoboBrain processor locations
-DEFAULT_TOKENIZER_ASSETS_REPO = "BAAI/RoboBrain2.0-3B"
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def make_efficientvla_pre_post_processors(
@@ -82,7 +61,7 @@ def make_efficientvla_pre_post_processors(
     1. Optional key renaming (dataset-specific key mapping)
     2. Add batch dimension to unbatched data
     3. Pack video/state/action/language/embodiment and apply optional min-max normalization before padding
-    4. Encode video+language with RoboBrain processor into model-ready tensors
+    4. Encode video+language with InternVL3 preprocessing into model-ready tensors
     5. Move tensors to device (GPU)
 
     NOTE: We optionally apply min-max normalization to STATE and ACTION using
@@ -109,25 +88,13 @@ def make_efficientvla_pre_post_processors(
     # Pass raw dataset_stats; normalization will occur inside pack step before padding
     padded_stats = dataset_stats or {}
 
-    # Define feature specs for optional normalization steps
-    _features: dict[str, PolicyFeature] = {
-        # Observation features (only add those we may normalize)
-        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_horizon, max_state_dim)),
-        # Action feature
-        "action": PolicyFeature(type=FeatureType.ACTION, shape=(action_horizon, max_action_dim)),
-    }
-
-    # Normalize STATE and ACTION with min_max (SO100-like default)
-    _norm_map = {
-        FeatureType.ACTION: NormalizationMode.MIN_MAX,
-        FeatureType.STATE: NormalizationMode.MIN_MAX,
-    }
-
     # Determine env action dimension from config (simple, object-like PolicyFeature)
     try:
         env_action_dim = int(config.output_features["action"].shape[0])
     except Exception:
         env_action_dim = 0
+
+    internvl3_input_size = int(config.image_size[0]) if isinstance(config.image_size, tuple) else int(config.image_size)
 
     input_steps: list[ProcessorStep] = [
         # 1. Rename keys if needed (e.g., dataset-specific camera names)
@@ -148,9 +115,11 @@ def make_efficientvla_pre_post_processors(
             normalize_min_max=True,
             stats=padded_stats,
         ),
-        # 4. RoboBrain encode (creates model-ready inputs)
+        # 4. InternVL3 encode (creates model-ready inputs)
         EfficientVLAEncodeStep(
-            tokenizer_assets_repo=config.tokenizer_assets_repo,
+            input_size=internvl3_input_size,
+            max_num=6,
+            use_thumbnail=True,
         ),
         EfficientVLACollateStep(),
         # 6. Move to device
@@ -190,33 +159,71 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
 
 
-def _build_robobrain_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
-    """
-    Build RoboBrain processor; prefer a user-provided local path, otherwise fall back to cached HF repo.
+def _build_transform(input_size: int) -> T.Compose:
+    return T.Compose(
+        [
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
 
-    Resolution order:
-    1) If `tokenizer_assets_repo` points to an existing path containing processor_config.json, use it.
-    2) Else, check HF_LEROBOT_HOME/<tokenizer_assets_repo> cache; if missing, download from Hub.
-    """
-    local_dir = Path(tokenizer_assets_repo).expanduser()
-    if (local_dir / "processor_config.json").exists():
-        cache_dir = local_dir
-    else:
-        cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
-        if not (cache_dir / "processor_config.json").exists():
-            cache_dir = Path(
-                snapshot_download(
-                    tokenizer_assets_repo,
-                    repo_type="model",
-                    cache_dir=HF_LEROBOT_HOME,
-                    local_dir=None,
-                )
-            )
 
-    proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True)
-    if hasattr(proc, "tokenizer"):
-        proc.tokenizer.padding_side = "left"
-    return proc
+def _dynamic_preprocess(
+    image: Image.Image,
+    *,
+    image_size: int,
+    use_thumbnail: bool,
+    max_num: int,
+) -> list[Image.Image]:
+    w, h = image.size
+    aspect_ratio = w / h
+
+    best_gw, best_gh = 1, 1
+    best_diff = 1e9
+    for gh in range(1, max_num + 1):
+        for gw in range(1, max_num + 1):
+            if gw * gh > max_num:
+                continue
+            diff = abs((gw / gh) - aspect_ratio)
+            if diff < best_diff:
+                best_diff = diff
+                best_gw, best_gh = gw, gh
+
+    target_w = best_gw * image_size
+    target_h = best_gh * image_size
+    resized = image.resize((target_w, target_h), resample=Image.BICUBIC)
+
+    tiles: list[Image.Image] = []
+    for j in range(best_gh):
+        for i in range(best_gw):
+            left = i * image_size
+            upper = j * image_size
+            right = left + image_size
+            lower = upper + image_size
+            tiles.append(resized.crop((left, upper, right, lower)))
+
+    if use_thumbnail and len(tiles) != 1:
+        tiles.append(image.resize((image_size, image_size), resample=Image.BICUBIC))
+
+    return tiles
+
+
+def _load_internvl3_pixels(
+    image: Image.Image,
+    *,
+    input_size: int,
+    max_num: int,
+    use_thumbnail: bool,
+) -> torch.Tensor:
+    transform = _build_transform(input_size)
+    tiles = _dynamic_preprocess(
+        image,
+        image_size=input_size,
+        use_thumbnail=use_thumbnail,
+        max_num=max_num,
+    )
+    return torch.stack([transform(t) for t in tiles])
 
 @dataclass
 @ProcessorStepRegistry.register(name="efficientvla_pack_inputs_v1")
@@ -467,16 +474,11 @@ class EfficientVLAPackInputsStep(ProcessorStep):
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="efficientvla_encode_robobrain_v1")
+@ProcessorStepRegistry.register(name="efficientvla_encode_internvl3_v1")
 class EfficientVLAEncodeStep(ProcessorStep):
-    tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO
-    _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
-
-    @property
-    def proc(self) -> ProcessorMixin:
-        if self._proc is None:
-            self._proc = _build_robobrain_processor(self.tokenizer_assets_repo)
-        return self._proc
+    input_size: int = 364
+    max_num: int = 6
+    use_thumbnail: bool = True
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
@@ -502,37 +504,22 @@ class EfficientVLAEncodeStep(ProcessorStep):
                 raise ValueError(f"Unexpected video shape: {vt.shape}")
             img = Image.fromarray(rearrange(frame, "c h w -> h w c"))
 
-            messages = [
+            pixel_values = _load_internvl3_pixels(
+                img,
+                input_size=self.input_size,
+                max_num=self.max_num,
+                use_thumbnail=self.use_thumbnail,
+            )
+
+            encoded_inputs.append(
                 {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": img},
-                        {"type": "text", "text": lang},
-                    ],
+                    "pixel_values": pixel_values,
+                    "num_patches_list": [int(pixel_values.shape[0])],
+                    "language": lang,
                 }
-            ]
-            text_prompt = self.proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            )
 
-            # Align with RoboBrain2.0 inference: prefer qwen_vl_utils.process_vision_info when available
-            if process_vision_info is not None:
-                image_inputs, video_inputs = process_vision_info(messages)
-                processed = self.proc(
-                    text=[text_prompt],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                )
-            else:
-                processed = self.proc(
-                    text=[text_prompt],
-                    images=[img],
-                    padding=True,
-                    return_tensors="pt",
-                )
-            encoded_inputs.append({k: v for k, v in processed.items()})
-
-        comp["robobrain_inputs"] = encoded_inputs
+        comp["internvl3_inputs"] = encoded_inputs
         obs.pop("video", None)
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
@@ -543,35 +530,17 @@ class EfficientVLAEncodeStep(ProcessorStep):
         return features
 
 
-# Collate RoboBrain-processed inputs
-def collate_robobrain(features: list[dict[str, Any]]) -> dict[str, Any]:
-    batch: dict[str, Any] = {}
-    keys = features[0].keys()
-
-    for key in keys:
-        values = [elem[key] for elem in features]
-        if isinstance(values[0], torch.Tensor):
-            batch[key] = torch.cat(values, dim=0)
-        else:
-            batch[key] = values
-    return batch
-
-
 @dataclass
-@ProcessorStepRegistry.register(name="efficientvla_collate_robobrain_v1")
+@ProcessorStepRegistry.register(name="efficientvla_collate_internvl3_v1")
 class EfficientVLACollateStep(ProcessorStep):
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
-        contents = comp.get("robobrain_inputs")
+        contents = comp.get("internvl3_inputs")
         if not contents:
             return transition
 
-        batched = collate_robobrain(contents)
-
-        for k, v in batched.items():
-            comp[k] = v
-        comp.pop("robobrain_inputs", None)
+        comp["internvl3_inputs"] = contents
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition

@@ -26,11 +26,16 @@ Groot-derived implementation intact. The intent is to:
 - Provide a training forward that can call the model forward if batch structure matches.
 """
 
+import json
 import os
+from pathlib import Path
+import shutil
 from collections import deque
 
 import torch
 from torch import Tensor
+from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from safetensors.torch import load_file as load_file_as_safetensor, save_model as save_model_as_safetensor
 
 from lerobot.policies.efficientvla.configuration_efficientvla import EfficientVLAConfig
 from lerobot.policies.efficientvla.efficientvla_v1 import EfficientVLAV1
@@ -43,16 +48,140 @@ class EfficientVLAPolicy(PreTrainedPolicy):
     name = "efficientvla"
     config_class = EfficientVLAConfig
 
-    def __init__(self, config: EfficientVLAConfig):
+    def __init__(self, config: EfficientVLAConfig, *, skip_init_load: bool = False):
         """Initialize EfficientVLA policy wrapper."""
         super().__init__(config)
         config.validate_features()
         self.config = config
 
         # Initialize model using ported components
-        self._efficientvla_model = self._create_efficientvla_model()
+        self._efficientvla_model = None
+        if not skip_init_load:
+            self._efficientvla_model = self._create_efficientvla_model()
 
         self.reset()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_name_or_path: str | Path,
+        *,
+        config: EfficientVLAConfig | None = None,
+        force_download: bool = False,
+        resume_download: bool | None = None,
+        proxies: dict | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+        strict: bool = False,
+        **kwargs,
+    ) -> "EfficientVLAPolicy":
+        if config is None:
+            config = EfficientVLAConfig.from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                **kwargs,
+            )
+
+        model_id = Path(pretrained_name_or_path)
+        if model_id.is_dir() and model_id.name == "vlm":
+            candidate_root = model_id.parent
+            if (candidate_root / "heads").is_dir():
+                model_id = candidate_root
+        vlm_dir = model_id / "vlm"
+        heads_dir = model_id / "heads"
+        if model_id.is_dir() and vlm_dir.is_dir() and heads_dir.is_dir():
+            policy = cls(config, skip_init_load=True)
+            config_path = vlm_dir / "config.json"
+            use_vlm_dir = True
+            if config_path.exists():
+                try:
+                    with config_path.open("r", encoding="utf-8") as config_file:
+                        cfg = json.load(config_file)
+                    if cfg.get("model_type") != "internvl_chat":
+                        use_vlm_dir = False
+                    if not cfg.get("vision_config") or not cfg.get("llm_config"):
+                        use_vlm_dir = False
+                except Exception:
+                    use_vlm_dir = False
+            else:
+                use_vlm_dir = False
+            vlm_load_path = str(vlm_dir) if use_vlm_dir else policy.config.base_model_path
+            assets_repo = str(vlm_dir) if use_vlm_dir else policy.config.tokenizer_assets_repo
+            if not use_vlm_dir:
+                print(
+                    "[EFFICIENTVLA] VLM config is not a full InternVL3 config. "
+                    "Falling back to base_model_path for VLM; heads will still load."
+                )
+            try:
+                policy._efficientvla_model = EfficientVLAV1.from_pretrained(
+                    pretrained_model_name_or_path=vlm_load_path,
+                    tokenizer_assets_repo=assets_repo,
+                    tune_llm=policy.config.tune_llm,
+                    tune_visual=policy.config.tune_visual,
+                    tune_projector=policy.config.tune_projector,
+                    tune_diffusion_model=policy.config.tune_diffusion_model,
+                    lora_rank=0,
+                    lora_alpha=policy.config.lora_alpha,
+                    lora_dropout=policy.config.lora_dropout,
+                    lora_full_model=False,
+                    scale=getattr(policy.config, "scale", "medium"),
+                    use_bf16=policy.config.use_bf16,
+                )
+            except ModuleNotFoundError as exc:
+                print(
+                    "[EFFICIENTVLA] VLM checkpoint is missing InternVL3 remote code. "
+                    "Falling back to base_model_path for VLM; heads will still load."
+                )
+                policy._efficientvla_model = EfficientVLAV1.from_pretrained(
+                    pretrained_model_name_or_path=policy.config.base_model_path,
+                    tokenizer_assets_repo=policy.config.tokenizer_assets_repo,
+                    tune_llm=policy.config.tune_llm,
+                    tune_visual=policy.config.tune_visual,
+                    tune_projector=policy.config.tune_projector,
+                    tune_diffusion_model=policy.config.tune_diffusion_model,
+                    lora_rank=0,
+                    lora_alpha=policy.config.lora_alpha,
+                    lora_dropout=policy.config.lora_dropout,
+                    lora_full_model=False,
+                    scale=getattr(policy.config, "scale", "medium"),
+                    use_bf16=policy.config.use_bf16,
+                )
+            policy._load_split_heads(heads_dir, strict=strict)
+            policy.to(policy.config.device)
+            policy.eval()
+            return policy
+
+        return super().from_pretrained(
+            pretrained_name_or_path,
+            config=config,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            revision=revision,
+            strict=strict,
+            **kwargs,
+        )
+
+    def _load_split_heads(self, heads_dir: Path, *, strict: bool) -> None:
+        head_file = heads_dir / SAFETENSORS_SINGLE_FILE
+        if not head_file.exists():
+            raise FileNotFoundError(f"Missing heads checkpoint: {head_file}")
+        state = load_file_as_safetensor(str(head_file))
+        projector_state = {k.replace("projector.", "", 1): v for k, v in state.items() if k.startswith("projector.")}
+        action_state = {k.replace("action_head.", "", 1): v for k, v in state.items() if k.startswith("action_head.")}
+        self._efficientvla_model.backbone.project.load_state_dict(projector_state, strict=strict)
+        self._efficientvla_model.action_head.load_state_dict(action_state, strict=strict)
 
     def _create_efficientvla_model(self):
         """Create and initialize the EfficientVLA model using ported API.
@@ -68,6 +197,7 @@ class EfficientVLAPolicy(PreTrainedPolicy):
 
         model = EfficientVLAV1.from_pretrained(
             pretrained_model_name_or_path=self.config.base_model_path,
+            tokenizer_assets_repo=self.config.tokenizer_assets_repo,
             tune_llm=self.config.tune_llm,
             tune_visual=self.config.tune_visual,
             tune_projector=self.config.tune_projector,
@@ -88,6 +218,67 @@ class EfficientVLAPolicy(PreTrainedPolicy):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+    def _save_pretrained(self, save_directory: Path) -> None:
+        save_directory = Path(save_directory)
+        self.config._save_pretrained(save_directory)
+        vlm_dir = save_directory / "vlm"
+        heads_dir = save_directory / "heads"
+        vlm_dir.mkdir(parents=True, exist_ok=True)
+        heads_dir.mkdir(parents=True, exist_ok=True)
+
+        backbone = self._efficientvla_model.backbone
+        vlm_model = backbone.model
+        if backbone.use_lora:
+            language_model = getattr(vlm_model, "language_model", None)
+            if language_model is not None and hasattr(language_model, "merge_and_unload"):
+                vlm_model.language_model = language_model.merge_and_unload()
+            elif hasattr(vlm_model, "merge_and_unload"):
+                vlm_model = vlm_model.merge_and_unload()
+                backbone.model = vlm_model
+        vlm_model.save_pretrained(str(vlm_dir), safe_serialization=True)
+
+        config_path = vlm_dir / "config.json"
+        assets_dir = Path(self.config.tokenizer_assets_repo).expanduser()
+        assets_config = assets_dir / "config.json"
+        if assets_config.exists():
+            needs_replace = False
+            try:
+                with config_path.open("r", encoding="utf-8") as config_file:
+                    saved_cfg = json.load(config_file)
+                if saved_cfg.get("model_type") != "internvl_chat":
+                    needs_replace = True
+                if not saved_cfg.get("vision_config") or not saved_cfg.get("llm_config"):
+                    needs_replace = True
+            except Exception:
+                needs_replace = True
+            if needs_replace:
+                shutil.copy2(assets_config, config_path)
+
+        try:
+            backbone.tokenizer.save_pretrained(str(vlm_dir))
+        except Exception:
+            pass
+
+        assets_dir = Path(self.config.tokenizer_assets_repo).expanduser()
+        if assets_dir.exists():
+            for src in assets_dir.iterdir():
+                if not src.is_file():
+                    continue
+                if src.name == SAFETENSORS_SINGLE_FILE:
+                    continue
+                dst = vlm_dir / src.name
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+
+        class _HeadBundle(torch.nn.Module):
+            def __init__(self, projector, action_head):
+                super().__init__()
+                self.projector = projector
+                self.action_head = action_head
+
+        head_bundle = _HeadBundle(backbone.project, self._efficientvla_model.action_head)
+        save_model_as_safetensor(head_bundle, str(heads_dir / SAFETENSORS_SINGLE_FILE))
+
     def get_optim_params(self) -> dict:
         return self.parameters()
 
@@ -100,10 +291,11 @@ class EfficientVLAPolicy(PreTrainedPolicy):
             "action",
             "action_mask",
             "embodiment_id",
+            "internvl3_inputs",
             "input_ids",
             "attention_mask",
             "pixel_values",
-            "image_grid_thw",
+            "image_flags",
         }
         efficientvla_inputs = {
             k: v
@@ -143,10 +335,11 @@ class EfficientVLAPolicy(PreTrainedPolicy):
             "action",
             "action_mask",
             "embodiment_id",
+            "internvl3_inputs",
             "input_ids",
             "attention_mask",
             "pixel_values",
-            "image_grid_thw",
+            "image_flags",
         }
         efficientvla_inputs = {
             k: v

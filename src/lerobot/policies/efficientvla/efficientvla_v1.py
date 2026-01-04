@@ -14,8 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import TYPE_CHECKING
+import importlib
 
 import numpy as np
 import torch
@@ -26,10 +25,8 @@ from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 from peft import LoraConfig, get_peft_model
 
 
-from lerobot.utils.import_utils import _transformers_available
-
-# Conditional import for type checking and lazy loading
-from transformers import AutoConfig, Qwen2_5_VLForConditionalGeneration, PretrainedConfig, PreTrainedModel
+# Transformers imports
+from transformers import AutoModel, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
 
 import tree
@@ -40,9 +37,13 @@ from lerobot.policies.efficientvla.action_head.flow_matching_action_head import 
     FlowmatchingActionHeadConfig,
 )
 
-# Defaults for RoboBrain backbone
-DEFAULT_ROBOBRAIN_MODEL = "BAAI/RoboBrain2.0-3B"
-DEFAULT_TOKENIZER_ASSETS_REPO = "BAAI/RoboBrain2.0-3B"
+# Defaults for InternVL3 backbone
+DEFAULT_INTERNVL3_MODEL = (
+    "/home/img/project/lerobot/src/lerobot/policies/efficientvla/InternVL3-1B/internvl3_1b_sft"
+)
+DEFAULT_TOKENIZER_ASSETS_REPO = (
+    "/home/img/project/lerobot/src/lerobot/policies/efficientvla/InternVL3-1B/internvl3_1b_sft"
+)
 
 SCALE_PRESETS = {
     "large": {
@@ -105,10 +106,10 @@ SCALE_PRESETS = {
 }
 
 
-class RoboBrainBackbone(nn.Module):
+class InternVL3Backbone(nn.Module):
     def __init__(
         self,
-        model_path: str = DEFAULT_ROBOBRAIN_MODEL,
+        model_path: str = DEFAULT_INTERNVL3_MODEL,
         tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO,
         tune_llm: bool = False,
         tune_visual: bool = False,
@@ -121,24 +122,40 @@ class RoboBrainBackbone(nn.Module):
         lora_full_model: bool = False,
     ):
         """
-        Lightweight wrapper around RoboBrain base model to emit backbone_features/attention_mask.
+        Lightweight wrapper around InternVL3 base model to emit backbone_features/attention_mask.
         We keep a projection to 768 (1/2 of the original 1536) so the action head dimensions remain unchanged.
         """
         super().__init__()
-        if AutoConfig is None or Qwen2_5_VLForConditionalGeneration is None:
-            raise ImportError("transformers is required for RoboBrainBackbone")
+        if AutoModel is None or AutoTokenizer is None:
+            raise ImportError("transformers is required for InternVL3Backbone")
 
-        torch_dtype = torch.bfloat16 if load_bf16 else None
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        self.hidden_size = getattr(config, "hidden_size", 0)
+        self.model_path = model_path
+        self.tokenizer_assets_repo = tokenizer_assets_repo
+        torch_dtype = self._resolve_torch_dtype(load_bf16)
+        tokenizer_path = tokenizer_assets_repo or model_path
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+            use_fast=False,
+            fix_mistral_regex=True,
+        )
+        if hasattr(self.tokenizer, "padding_side"):
+            self.tokenizer.padding_side = "left"
 
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        self.model = AutoModel.from_pretrained(
             model_path,
             trust_remote_code=True,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
-        )
+        ).eval()
 
+        self.IMG_START_TOKEN = "<img>"
+        self.IMG_END_TOKEN = "</img>"
+        self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+        self.model.img_context_token_id = self.tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT_TOKEN)
+
+        self.get_conv_template = self._resolve_get_conv_template()
+        self.hidden_size = self._resolve_hidden_size()
         self.project = nn.Linear(self.hidden_size, project_to_dim) if project_to_dim is not None else nn.Identity()
 
         self.tune_llm = tune_llm
@@ -159,9 +176,56 @@ class RoboBrainBackbone(nn.Module):
                 bias="none",
                 task_type="CAUSAL_LM",
             )
-            self.model = get_peft_model(self.model, lora_config)
+            if hasattr(self.model, "language_model"):
+                self.model.language_model = get_peft_model(self.model.language_model, lora_config)
+            else:
+                self.model = get_peft_model(self.model, lora_config)
 
         self.set_trainable_parameters()
+
+    def _resolve_torch_dtype(self, load_bf16: bool) -> torch.dtype:
+        if torch.cuda.is_available():
+            if load_bf16 and torch.cuda.get_device_capability(0)[0] >= 8:
+                return torch.bfloat16
+            return torch.float16
+        return torch.float32
+
+    def _resolve_hidden_size(self) -> int:
+        config = getattr(self.model, "config", None)
+        if config is not None:
+            for candidate in (
+                getattr(config, "hidden_size", None),
+                getattr(getattr(config, "llm_config", None), "hidden_size", None),
+                getattr(getattr(config, "text_config", None), "hidden_size", None),
+            ):
+                if isinstance(candidate, int) and candidate > 0:
+                    return candidate
+        try:
+            return int(self.model.get_input_embeddings().weight.shape[1])
+        except Exception as exc:
+            raise ValueError("Unable to infer hidden size for InternVL3 model.") from exc
+
+    def _resolve_get_conv_template(self):
+        model_mod = self.model.__class__.__module__
+        pkg = model_mod.rsplit(".", 1)[0]
+        try:
+            conv_mod = importlib.import_module(pkg + ".conversation")
+            return getattr(conv_mod, "get_conv_template")
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Missing conversation module for InternVL3. "
+                f"Got model module '{model_mod}'. "
+                "This usually means the VLM checkpoint was saved from the wrong base model "
+                "(e.g., Qwen2 without InternVL3 remote code). "
+                "Re-save the VLM using InternVL3 (after merging LoRA), or point to the original "
+                "InternVL3 repo path."
+            ) from exc
+
+    def _get_call_model(self):
+        model = self.model
+        if getattr(model, "peft_config", None) is not None:
+            return getattr(model, "base_model", model)
+        return model
 
     def set_trainable_parameters(self, tune_visual=False, tune_llm=False):
         self.tune_visual, self.tune_llm = tune_visual, tune_llm
@@ -186,33 +250,102 @@ class RoboBrainBackbone(nn.Module):
             self.model.eval()
 
     def prepare_input(self, batch: dict) -> BatchFeature:
+        if "internvl3_inputs" in batch:
+            return BatchFeature(data={"internvl3_inputs": batch["internvl3_inputs"]})
+
         keep_keys = [
-            "input_ids", 
-            "attention_mask", 
-            "pixel_values", 
-            "image_grid_thw", 
-            "video_grid_thw"
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_flags",
         ]
-        
-        filtered_batch = {
-            k: v for k, v in batch.items() 
-            if k in keep_keys and v is not None
-        }
+        filtered_batch = {k: v for k, v in batch.items() if k in keep_keys and v is not None}
         return BatchFeature(data=filtered_batch)
+
+    def _build_query(self, text: str, num_patches_list: list[int]) -> str:
+        text = "" if text is None else str(text)
+        if len(num_patches_list) == 0:
+            question = text
+        elif len(num_patches_list) == 1:
+            question = f"<image>\n{text}"
+        else:
+            prefix = "".join([f"Image-{i + 1}: <image>\n" for i in range(len(num_patches_list))])
+            question = prefix + text
+
+        template = self.get_conv_template(self.model.template)
+        template.system_message = self.model.system_message
+        template.append_message(template.roles[0], question)
+        template.append_message(template.roles[1], None)
+        query = template.get_prompt()
+
+        for n_patch in num_patches_list:
+            image_tokens = (
+                self.IMG_START_TOKEN
+                + (self.IMG_CONTEXT_TOKEN * self.model.num_image_token * n_patch)
+                + self.IMG_END_TOKEN
+            )
+            query = query.replace("<image>", image_tokens, 1)
+        return query
+
+    def _encode_internvl3_inputs(
+        self, internvl3_inputs: list[dict[str, torch.Tensor | list[int] | str]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not internvl3_inputs:
+            raise ValueError("internvl3_inputs is empty.")
+
+        device = next(self.model.parameters()).device
+        dtype = next(self.model.parameters()).dtype
+
+        queries: list[str] = []
+        pixel_values_list: list[torch.Tensor] = []
+        image_flags_list: list[torch.Tensor] = []
+        for item in internvl3_inputs:
+            text = item.get("language", "Perform the task.")
+            num_patches_list = item.get("num_patches_list", [])
+            queries.append(self._build_query(text, num_patches_list))
+
+            pixel_values = item.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values_list.append(pixel_values)
+                image_flags_list.append(
+                    torch.ones((pixel_values.shape[0], 1), dtype=torch.long)
+                )
+
+        if not pixel_values_list:
+            raise ValueError("InternVL3 inputs require pixel_values.")
+
+        model_inputs = self.tokenizer(queries, return_tensors="pt", padding=True)
+        input_ids = model_inputs["input_ids"].to(device)
+        attention_mask = model_inputs["attention_mask"].to(device)
+
+        pixel_values = torch.cat(pixel_values_list, dim=0).to(device=device, dtype=dtype, non_blocking=True)
+        image_flags = torch.cat(image_flags_list, dim=0).to(device=device, dtype=torch.long, non_blocking=True)
+
+        call_model = self._get_call_model()
+        outputs = call_model(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            image_flags=image_flags,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden = outputs.hidden_states[-1] if outputs.hidden_states is not None else outputs.last_hidden_state
+        return hidden, attention_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        robobrain_inputs = dict(vl_input)
-        # Ensure attention mask is present and boolean
-        # attention_mask = robobrain_inputs.get("attention_mask")
-        # if attention_mask is not None and attention_mask.dtype != torch.bool:
-        #     robobrain_inputs["attention_mask"] = attention_mask.bool()
-        outputs = self.model(**robobrain_inputs, output_hidden_states=True, return_dict=True)
-        hidden = outputs.hidden_states[-1] if outputs.hidden_states is not None else outputs.last_hidden_state
-        features = self.project(hidden)
+        internvl3_inputs = dict(vl_input)
+        if "internvl3_inputs" in internvl3_inputs:
+            hidden, mask = self._encode_internvl3_inputs(internvl3_inputs["internvl3_inputs"])
+        else:
+            call_model = self._get_call_model()
+            outputs = call_model(**internvl3_inputs, output_hidden_states=True, return_dict=True)
+            hidden = outputs.hidden_states[-1] if outputs.hidden_states is not None else outputs.last_hidden_state
+            mask = internvl3_inputs.get("attention_mask")
 
-        mask = robobrain_inputs.get("attention_mask")
+        features = self.project(hidden)
         return BatchFeature(data={"backbone_features": features, "backbone_attention_mask": mask})
 
 
@@ -294,7 +427,7 @@ class EfficientVLAV1(PreTrainedModel):
                 "diffusion_model_cfg": preset["diffusion_model_cfg"],
             }
 
-        self.backbone = RoboBrainBackbone(**config.backbone_cfg)
+        self.backbone = InternVL3Backbone(**config.backbone_cfg)
         action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
         self.action_head = FlowmatchingActionHead(action_head_cfg)
 
@@ -433,6 +566,7 @@ class EfficientVLAV1(PreTrainedModel):
         lora_dropout = kwargs.pop("lora_dropout", 0.1)
         lora_full_model = kwargs.pop("lora_full_model", False)
         scale = kwargs.pop("scale", "medium").lower()
+        tokenizer_assets_repo = kwargs.pop("tokenizer_assets_repo", DEFAULT_TOKENIZER_ASSETS_REPO)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path} (Manual Mode)")
 
@@ -449,7 +583,7 @@ class EfficientVLAV1(PreTrainedModel):
         config.scale = scale
         config.backbone_cfg = {
             "model_path": local_model_path,
-            "tokenizer_assets_repo": DEFAULT_TOKENIZER_ASSETS_REPO,
+            "tokenizer_assets_repo": tokenizer_assets_repo,
             "tune_llm": tune_llm,
             "tune_visual": tune_visual,
             "project_to_dim": preset["project_to_dim"],

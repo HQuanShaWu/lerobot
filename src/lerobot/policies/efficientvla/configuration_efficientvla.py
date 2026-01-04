@@ -58,15 +58,19 @@ class EfficientVLAConfig(PreTrainedConfig):
     )
 
     # Image preprocessing (adjust to match the pretrained model's expected input)
-    image_size: tuple[int, int] = (224, 224)
+    image_size: tuple[int, int] = (364, 364)
 
-    # Model parameters (defaults set to RoboBrain 3B; adjust if you use another variant)
+    # Model parameters (defaults set to InternVL3-1B; adjust if you use another variant)
 
     # Path or HuggingFace model ID for the base model
-    base_model_path: str = "BAAI/RoboBrain2.0-3B"
+    base_model_path: str = (
+        "/home/img/project/lerobot/src/lerobot/policies/efficientvla/InternVL3-1B/internvl3_1b_sft"
+    )
 
-    # HF repo ID (or local path) that hosts tokenizer/processor assets for RoboBrain.
-    tokenizer_assets_repo: str = "BAAI/RoboBrain2.0-3B"
+    # HF repo ID (or local path) that hosts tokenizer assets for InternVL3.
+    tokenizer_assets_repo: str = (
+        "/home/img/project/lerobot/src/lerobot/policies/efficientvla/InternVL3-1B/internvl3_1b_sft"
+    )
 
     # Embodiment tag to use for training (e.g. 'new_embodiment', 'gr1')
     embodiment_tag: str = "new_embodiment"
