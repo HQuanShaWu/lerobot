@@ -25,8 +25,8 @@ GRAD_ACCUM_STEPS=16
 # 这是一个累积计数器，仅用于日志显示，不传给训练命令
 total_accumulated_steps=180000 
 
-current_model_path="/home/img/project/lerobot/efficientvla/train/mid_scale_horizon16_180ksteps_lora_rank32/checkpoints/180000/pretrained_model"
-base_output_dir="efficientvla/train/pretrain_mid_scale_horizon16_lora_rank32"
+current_model_path="/home/img/project/lerobot/policies/efficientvla/train/mid_scale_horizon16_180ksteps_lora_rank32/checkpoints/180000/pretrained_model"
+base_output_dir="policies/efficientvla/train/pretrain_mid_scale_horizon16_lora_rank32"
 
 i=1
 

@@ -1,9 +1,9 @@
 delta_steps=100000
 GRAD_ACCUM_STEPS=16
 BATCH_SIZE=16
-this_output_dir="efficientvla/train/division_internvl_1b_pretrain_mid_scale_horizon16_lora_rank32"
+this_output_dir="policies/efficientvla/train/division_internvl_1b_pretrain_mid_scale_horizon16_lora_rank32"
 dataset_name="trantor2nd/rheovla_dataset"
-# current_model_path="/home/img/project/lerobot/efficientvla/train/division_internvl_1b_pretrain_mid_scale_horizon16_lora_rank32_/checkpoints/000001/pretrained_model"
+# current_model_path="/home/img/project/lerobot/policies/efficientvla/train/division_internvl_1b_pretrain_mid_scale_horizon16_lora_rank32_/checkpoints/000001/pretrained_model"
 lerobot-train \
     --dataset.repo_id="$dataset_name" \
     --output_dir="$this_output_dir" \

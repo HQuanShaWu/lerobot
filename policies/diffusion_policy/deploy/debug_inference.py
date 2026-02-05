@@ -13,7 +13,7 @@ from lerobot.processor.converters import policy_action_to_transition
 # 1. 你的 Dataset 路径 (来自 train_diffusion_policy.sh)
 DATASET_PATH = "/home/img/project/lerobot/dynvla_dataset_lerobot"
 # 2. 你的 Checkpoint 路径
-CHECKPOINT_PATH = "/home/img/project/lerobot/diffusion_policy/train/100ksteps/checkpoints/100000/pretrained_model"
+CHECKPOINT_PATH = "/home/img/project/lerobot/policies/diffusion_policy/train/100ksteps/checkpoints/100000/pretrained_model"
 # 3. 设备
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ===========================================

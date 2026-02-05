@@ -1,7 +1,7 @@
 # !/bin/bash
 # dataset_name="trantor2nd/rheovla_dataset"
 dataset_name="/home/img/project/lerobot/dynvla_dataset_lerobot"
-# current_model_path="/home/img/project/lerobot/diffusion_policy/train/100ksteps/checkpoints/100000/pretrained_model"
+# current_model_path="/home/img/project/lerobot/policies/diffusion_policy/train/100ksteps/checkpoints/100000/pretrained_model"
 grad_acc=16
 steps=100000
 save_freq=50000
