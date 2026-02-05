@@ -166,6 +166,7 @@ wandb/
 # Data folders
 data/
 outputs/
+dynvla_dataset_lerobot/
 
 # Translations
 *.mo
@@ -179,6 +180,7 @@ outputs/
 *.part
 
 # checkpoint
-diffusionpolicy/train/
-efficientvla/
-Rheovla/output/
+*/diffusion_policy/train
+*/efficientvla/train
+*/smolvla/train
+*.safetensors

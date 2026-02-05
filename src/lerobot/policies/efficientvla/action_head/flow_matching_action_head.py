@@ -309,7 +309,7 @@ class FlowmatchingActionHead(nn.Module):
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_projector(backbone_features)
-        backbone_features = self.vl_self_attention(backbone_features)
+        # backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
