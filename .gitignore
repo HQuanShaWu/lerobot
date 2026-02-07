@@ -180,7 +180,5 @@ dynvla_dataset_lerobot/
 *.part
 
 # checkpoint
-*/diffusion_policy/train
-*/efficientvla/train
-*/smolvla/train
+policies/*/train
 *.safetensors
